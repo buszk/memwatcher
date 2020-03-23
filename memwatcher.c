@@ -3,24 +3,22 @@
 #define __USE_GNU
 #include <stdlib.h>
 #include <fcntl.h> 
-#include <signal.h> 
 #include <stdio.h> 
 #include <string.h> 
-#include <sys/mman.h> 
 #include <sys/stat.h> 
 #include <sys/types.h> 
 #include <unistd.h> 
-#include <assert.h>
 #include <pthread.h>
 #include <ucontext.h>
-#include <inttypes.h>
 
 #include <Zydis/Zydis.h>
+#include "memwatcher.h"
 
 /* workaround for ucontext.h */
 #define REG_RIP 16
 #define PAGE_SIZE 0x1000
 #define INLINE inline __attribute__((always_inline))
+
 
 struct _memory_watchlist_addr {
     void *addr;
@@ -40,9 +38,15 @@ struct _callback_info *_cb_list = NULL;
 
 pthread_spinlock_t mwl_lock;
 pthread_spinlock_t cbl_lock;
+uint32_t count;
 struct sigaction sa;
 
-void _sigsegv_protector(int s, siginfo_t *sig_info, void *context);
+static void _sigsegv_protector(int s, siginfo_t *sig_info, void *context);
+
+/* For testing purpose */
+uint32_t _get_trap_count() {
+    return count;
+}
 
 static void __attribute__((constructor)) _init_memwatcher() {
     int ret;
@@ -136,7 +140,7 @@ void _unwatch_address(void *addr, int prot) {
     _memwatcher_unlock();
 }
 
-unsigned char _zydis_get_instr_len(void* pc) {
+static uint8_t _zydis_get_instr_len(void* pc) {
     ZydisDecoder decoder;
     ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_ADDRESS_WIDTH_64);
     ZydisDecodedInstruction instruction;
@@ -146,7 +150,7 @@ unsigned char _zydis_get_instr_len(void* pc) {
     return 0;
 }
 
-void* _alloc_ex_page(void* inst, uint8_t inst_len) {
+static void* _alloc_ex_page(void* inst, uint8_t inst_len) {
     int fd;
     char *res;
     res = malloc(PAGE_SIZE);
@@ -169,7 +173,7 @@ void* _alloc_ex_page(void* inst, uint8_t inst_len) {
     return res;
 }
 
-void _sigsegv_protector(int s, siginfo_t *sig_info, void *vcontext)
+static void _sigsegv_protector(int s, siginfo_t *sig_info, void *vcontext)
 {
     ucontext_t *context = (ucontext_t*)vcontext;
     unsigned char len = 0;
@@ -238,6 +242,7 @@ void _sigsegv_protector(int s, siginfo_t *sig_info, void *vcontext)
             cb_info->next->prev = cb_info->prev;
         }
         free(cb_info);
+        count ++;
     } 
     else {
         printf("---\n");
@@ -247,43 +252,3 @@ void _sigsegv_protector(int s, siginfo_t *sig_info, void *vcontext)
     _callbackinfo_unlock();
     _memwatcher_unlock();
 }
-
-void test_segfault_protector()
-{
-    char *memory;
-    int fd;
-
-    // allocate page-aligned memory
-    fd = open ("/dev/zero", O_RDONLY); 
-    memory = mmap(NULL, PAGE_SIZE, PROT_WRITE, MAP_PRIVATE, fd, 0); 
-    assert(memory != NULL);
-    close (fd); 
-    // obtain a private copy of the page
-    memory[0] = 0;
-
-    // Here's the main part ... add the allocated memory to the
-    // watchlist. After this call, the memory will be unreadable/unwriteble.
-    _watch_address(memory, PAGE_SIZE, PROT_NONE);
-    
-    // Let's try this out. The following line should cause a SIGSEGV.
-    memory[1] = 1; 
-    memory[9] = 2; 
-
-    _unwatch_address(memory, PROT_READ|PROT_WRITE);
-
-    memory[3] = 3;
-
-    // And we're finished.
-    munmap (memory, PAGE_SIZE); 
-}
-
-int main () 
-{
-
-
-    // Run test
-    test_segfault_protector();
-
-    printf("Program exited\n");
-    return 0; 
-} 

@@ -2,15 +2,15 @@ CC=gcc
 LDFLAGS=-pthread -lZydis -lZycore
 CFLAGS=-O2 -g -I/usr/include/x86_64-linux-gnu
 
-PROGS=napsy memwatcher
+PROGS=napsy test_access
 
 all: $(PROGS)
 
-memwatcher: memwatcher.o
+test_access: test_access.o memwatcher.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 %.o: %.c
 	$(CC) -c -o $@ $^ $(CFLAGS)
 
 clean:
-	rm -f $(PROGS) $(PROGS:=.o)
+	rm -f $(PROGS) *.o
