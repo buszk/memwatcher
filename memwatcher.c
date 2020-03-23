@@ -13,6 +13,7 @@
 
 #include <Zydis/Zydis.h>
 #include "memwatcher.h"
+#include "list.h"
 
 /* workaround for ucontext.h */
 #define REG_RIP 16
@@ -25,10 +26,11 @@
  * We use this data structure to keep tracked pages 
  */
 struct _watch_page {
+    struct _watch_page *next, *prev;
     void  *addr;
     size_t size;
-    struct _watch_page *next, *prev;
     uint16_t ref_cnt;
+    int prot;
 };
 
 /* 
@@ -36,9 +38,9 @@ struct _watch_page {
  * We use this data structure to keep tracked regions 
  */
 struct _watch_region {
+    struct _watch_region *next, *prev;
     void  *addr;
     size_t size;
-    struct _watch_region *next, *prev;
     uint16_t ref_cnt;
 };
 
@@ -47,6 +49,7 @@ struct _watch_region {
  * We use this data structure to keep track of links
  */
 struct _page_region_link {
+    struct _page_region_link *next, *prev;
     struct _watch_page    *page;
     struct _watch_region  *region;
 };
@@ -57,17 +60,20 @@ struct _page_region_link {
  * reenable memory access.
  */
 struct _seg_callback {
+    struct _seg_callback *next, *prev;
     void *page;
     void *next_inst;
     struct _watch_page *watch;
-    struct _seg_callback *next, *prev;
 };
 
-struct _watch_page *_page_watchlist = NULL;
-struct _seg_callback *_callback_list = NULL;
+struct _page_region_link  *_link_list         = NULL;
+struct _watch_region      *_region_watchlist  = NULL;
+struct _watch_page        *_page_watchlist    = NULL;
+struct _seg_callback      *_callback_list     = NULL;
 
 pthread_spinlock_t page_list_lock;
 pthread_spinlock_t cb_list_lock;
+
 uint32_t count;
 struct sigaction sa;
 
@@ -98,7 +104,7 @@ static void __attribute__((constructor)) _init_memwatcher() {
     sigaction (SIGSEGV, &sa, NULL); 
 }
 
-INLINE void _memwatcher_lock() {
+INLINE void _pagelist_lock() {
     int ret = pthread_spin_lock(&page_list_lock);
     if (ret != 0) {
         fprintf(stderr, "Failed to lock\n");
@@ -106,7 +112,7 @@ INLINE void _memwatcher_lock() {
     }
 }
 
-INLINE void _memwatcher_unlock() {
+INLINE void _pagelist_unlock() {
     int ret = pthread_spin_unlock(&page_list_lock);
     if (ret != 0) {
         fprintf(stderr, "Failed to unlock\n");
@@ -114,7 +120,7 @@ INLINE void _memwatcher_unlock() {
     }
 }
 
-INLINE void _callbackinfo_lock() {
+INLINE void _cblist_lock() {
     int ret = pthread_spin_lock(&cb_list_lock);
     if (ret != 0) {
         fprintf(stderr, "Failed to lock\n");
@@ -131,20 +137,16 @@ INLINE void _callbackinfo_unlock() {
 }
 
 void _watch_address(void *addr, size_t size, int prot) {
-    struct _watch_page *watched_addr = malloc(sizeof(*watched_addr));
-    watched_addr->addr = addr;
-    watched_addr->size = size;
+    struct _watch_page *watched_page = malloc(sizeof(*watched_page));
+    watched_page->addr = addr;
+    watched_page->size = size;
+    watched_page->prot = prot;
 
-    _memwatcher_lock();
+    _pagelist_lock();
 
-    if (_page_watchlist)
-        _page_watchlist->prev = watched_addr;
-    // prepend watch to list
-    watched_addr->next = _page_watchlist;
-    watched_addr->prev = NULL;
-    _page_watchlist = watched_addr;
+    LIST_ADD(_page_watchlist, watched_page);
 
-    _memwatcher_unlock();
+    _pagelist_unlock();
 
     // now protect the memory map
     mprotect(addr, size, prot);
@@ -152,25 +154,22 @@ void _watch_address(void *addr, size_t size, int prot) {
 
 void _unwatch_address(void *addr, int prot) {
 
-    _memwatcher_lock();
+    _pagelist_lock();
 
-    for (struct _watch_page * pagep = _page_watchlist; 
-                    pagep != NULL; pagep = pagep->next) {
+    struct _watch_page *pagep;
+    list_for_each(pagep, _page_watchlist) {
         if (pagep->addr == addr) {
             mprotect(pagep->addr, pagep->size, prot);
-            if (pagep->prev)
-                pagep->prev->next = pagep->next;
-            if (pagep->next)
-                pagep->next->prev = pagep->prev;
+            LIST_DEL(_page_watchlist, pagep);
             free(pagep);
             break;
         }
     }
 
-    _memwatcher_unlock();
+    _pagelist_unlock();
 }
 
-static uint8_t instr_len(void* pc) {
+static uint8_t _instr_len(void* pc) {
     ZydisDecoder decoder;
     ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_ADDRESS_WIDTH_64);
     ZydisDecodedInstruction instruction;
@@ -212,73 +211,67 @@ static void _sigsegv_protector(int s, siginfo_t *sig_info, void *vcontext)
     printf("%s: cause was address %p\n", __func__, sig_info->si_addr);
 
     rip = (void*)context->uc_mcontext.gregs[REG_RIP];
-    len = instr_len(rip);
+    len = _instr_len(rip);
     printf("%s: The next instruction loc: %p\n", __func__, rip);
     printf("%s:                      len: %d\n", __func__, len);
-    _memwatcher_lock();
+    
 
-    struct _watch_page *watched_addr = _page_watchlist;
+    struct _seg_callback *callback;
 
-    for (; watched_addr != NULL; watched_addr = watched_addr->next) {
-        if ( sig_info->si_addr >= watched_addr->addr && 
-             sig_info->si_addr < watched_addr->addr + watched_addr->size)
-            break;
-    }
-
-    _callbackinfo_lock();
-
-    struct _seg_callback *callback = _callback_list;
-
-    for (; callback != NULL; callback = callback->next) {
+    list_for_each(callback, _callback_list) {
         if ( sig_info->si_addr >= callback->page &&
              sig_info->si_addr < callback->page + PAGE_SIZE)
              break;
     }
 
-    if (watched_addr) {
+    _cblist_lock();
+    if (callback) {
+        printf("%s: raised because of trap from callback ...\n", __func__);
+        mprotect(callback->watch->addr, callback->watch->size, callback->watch->prot);
+        context->uc_mcontext.gregs[REG_RIP] = (uintptr_t)callback->next_inst;
+
+        munmap(callback->page, PAGE_SIZE);
+        LIST_DEL(_callback_list, callback);
+        free(callback);
+        count ++;
+    } 
+
+    _pagelist_lock();
+    struct _watch_page *watched_page;
+
+    list_for_each(watched_page, _page_watchlist) {
+        if ( sig_info->si_addr >= watched_page->addr && 
+             sig_info->si_addr < watched_page->addr + watched_page->size)
+            break;
+    }
+
+
+
+    if (watched_page) {
         printf("%s: raised because of invalid r/w acces to address (was in watchlist) ...\n", __func__);
         // printf("Fault instruction loc: 0x%016llx, len: %d\n", context->uc_mcontext.gregs[REG_RIP], len);
         // context->uc_mcontext.gregs[REG_RIP] += len;
 
-        mprotect (watched_addr->addr, watched_addr->size, PROT_READ | PROT_WRITE);
+        mprotect (watched_page->addr, watched_page->size, PROT_READ | PROT_WRITE);
         void *payload_page = (void*)_alloc_payload(rip, len);
         context->uc_mcontext.gregs[REG_RIP] = (uintptr_t)payload_page;
-        struct _seg_callback *info = malloc(sizeof(struct _seg_callback));
-        info->page = payload_page;
-        info->next_inst = rip+len;
-        info->watch = watched_addr;
+        struct _seg_callback *cb = malloc(sizeof(struct _seg_callback));
+        cb->page = payload_page;
+        cb->next_inst = rip+len;
+        cb->watch = watched_page;
 
-        if (_callback_list)
-            _callback_list->prev = info;
-        info->next = _callback_list;
-        _callback_list = info;
+        LIST_ADD(_callback_list, cb);
 
         printf("---\n");
     }
-    else if (callback) {
-        printf("%s: raised because of trap from callback ...\n", __func__);
-        mprotect(callback->watch->addr, callback->watch->size, PROT_NONE);
-        context->uc_mcontext.gregs[REG_RIP] = (uintptr_t)callback->next_inst;
+    
 
-        munmap(callback->page, PAGE_SIZE);
-        if (callback->prev) {
-            callback->prev->next = callback->next;
-        } 
-        else {
-            _callback_list = callback->next;
-        }
-        if (callback->next) {
-            callback->next->prev = callback->prev;
-        }
-        free(callback);
-        count ++;
-    } 
-    else {
+    if (!watched_page && !callback) {
         printf("---\n");
         exit(1);
     }
-    
+
     // ignore exit above
+    _pagelist_unlock();
     _callbackinfo_unlock();
-    _memwatcher_unlock();
 }
