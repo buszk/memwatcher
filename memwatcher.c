@@ -19,7 +19,7 @@
 #define REG_RIP 16
 #define PAGE_SIZE 0x1000
 #define INLINE inline __attribute__((always_inline))
-
+#define MEMWATCHER_STR "MemWatcher"
 
 /* 
  * mprotect() works with pages. 
@@ -29,7 +29,7 @@ struct _watch_page {
     struct _watch_page *next, *prev;
     void  *addr;
     size_t size;
-    uint16_t ref_cnt;
+    uint16_t region_cnt;
     int prot;
 };
 
@@ -63,7 +63,8 @@ struct _seg_callback {
     struct _seg_callback *next, *prev;
     void *page;
     void *next_inst;
-    struct _watch_page *watch;
+    struct _watch_page *watched_page;
+    struct _watch_region *watched_region;
 };
 
 struct _page_region_link  *_link_list         = NULL;
@@ -136,36 +137,90 @@ INLINE void _callbackinfo_unlock() {
     }
 }
 
-void _watch_address(void *addr, size_t size, int prot) {
+void _watch_page(void *addr, int prot) {
+    struct _watch_page *pagep;
+    list_for_each(pagep, _page_watchlist) {
+        if (pagep->addr == addr) {
+            if (pagep->prot == prot) {
+                fprintf(stderr, "inc\n");
+                pagep->region_cnt ++;
+            }
+            else {
+                fprintf(stderr, "%s: trying to set different protection on the same page\n", 
+                                        MEMWATCHER_STR);
+                exit(1);
+            }
+            return;
+        }
+    }
+    /* new tracked page */
     struct _watch_page *watched_page = malloc(sizeof(*watched_page));
     watched_page->addr = addr;
-    watched_page->size = size;
+    watched_page->size = PAGE_SIZE;
     watched_page->prot = prot;
-
-    _pagelist_lock();
+    watched_page->region_cnt = 1;
 
     LIST_ADD(_page_watchlist, watched_page);
 
-    _pagelist_unlock();
-
     // now protect the memory map
-    mprotect(addr, size, prot);
+    mprotect(addr, PAGE_SIZE, prot);
 }
 
-void _unwatch_address(void *addr, int prot) {
-
+void _watch_address(void *addr, size_t size, int prot) {
+    struct _watch_region *watched_region = malloc(sizeof(*watched_region));
+    watched_region->addr = addr;
+    watched_region->size = size;
+    
     _pagelist_lock();
+
+    LIST_ADD(_region_watchlist, watched_region);
+    for (uintptr_t page = (uintptr_t)addr & -PAGE_SIZE; 
+            page < (uintptr_t)addr + size; page+=PAGE_SIZE) {
+        _watch_page((void*)page, prot);
+    }
+
+    _pagelist_unlock();
+
+}
+
+void _unwatch_page(void*addr, int prot) {
 
     struct _watch_page *pagep;
     list_for_each(pagep, _page_watchlist) {
         if (pagep->addr == addr) {
-            mprotect(pagep->addr, pagep->size, prot);
-            LIST_DEL(_page_watchlist, pagep);
-            free(pagep);
+            if (pagep->region_cnt > 1) {
+                pagep->region_cnt--;
+                fprintf(stderr, "dec\n");
+            }
+            else {
+                mprotect(pagep->addr, pagep->size, prot);
+                LIST_DEL(_page_watchlist, pagep);
+                free(pagep);
+            }
             break;
         }
     }
 
+}
+
+void _unwatch_address(void *addr, int prot) {
+    _pagelist_lock();
+    struct _watch_region *regionp;
+    list_for_each(regionp, _region_watchlist) {
+        if (regionp->addr == addr) {
+            break;
+        }
+    }
+    if (!regionp) {
+        fprintf(stderr, "%s: error: unwatch address not exist\n", MEMWATCHER_STR);
+        exit(1);
+    }
+    for (uintptr_t page = (uintptr_t)regionp->addr & -PAGE_SIZE;
+                    page < (uintptr_t)regionp->addr + regionp->size; 
+                    page += PAGE_SIZE) {
+                _unwatch_page((void*)page, prot);
+    }
+    LIST_DEL(_region_watchlist, regionp);
     _pagelist_unlock();
 }
 
@@ -206,14 +261,14 @@ static void _sigsegv_protector(int s, siginfo_t *sig_info, void *vcontext)
     ucontext_t *context = (ucontext_t*)vcontext;
     unsigned char len = 0;
     void *rip;
-    printf("---\n");
-    printf("%s: Process received segmentation fault, examening ...\n", __func__);
-    printf("%s: cause was address %p\n", __func__, sig_info->si_addr);
+    fprintf(stderr, "---\n");
+    fprintf(stderr, "%s: Process received segmentation fault, examening ...\n", __func__);
+    fprintf(stderr, "%s: cause was address %p\n", __func__, sig_info->si_addr);
 
     rip = (void*)context->uc_mcontext.gregs[REG_RIP];
     len = _instr_len(rip);
-    printf("%s: The next instruction loc: %p\n", __func__, rip);
-    printf("%s:                      len: %d\n", __func__, len);
+    fprintf(stderr, "%s: The next instruction loc: %p\n", __func__, rip);
+    fprintf(stderr, "%s:                      len: %d\n", __func__, len);
     
 
     struct _seg_callback *callback;
@@ -226,14 +281,17 @@ static void _sigsegv_protector(int s, siginfo_t *sig_info, void *vcontext)
 
     _cblist_lock();
     if (callback) {
-        printf("%s: raised because of trap from callback ...\n", __func__);
-        mprotect(callback->watch->addr, callback->watch->size, callback->watch->prot);
+        fprintf(stderr, "%s: raised because of trap from callback ...\n", __func__);
+        mprotect(callback->watched_page->addr, callback->watched_page->size, callback->watched_page->prot);
         context->uc_mcontext.gregs[REG_RIP] = (uintptr_t)callback->next_inst;
 
         munmap(callback->page, PAGE_SIZE);
         LIST_DEL(_callback_list, callback);
+        if (callback->watched_region) {
+            fprintf(stderr, "%s: region watched\n", __func__);
+            count ++;
+        }
         free(callback);
-        count ++;
     } 
 
     _pagelist_lock();
@@ -245,29 +303,38 @@ static void _sigsegv_protector(int s, siginfo_t *sig_info, void *vcontext)
             break;
     }
 
+    struct _watch_region *watched_region;
+    list_for_each(watched_region, _region_watchlist) {
+        if (sig_info->si_addr >= watched_region->addr &&
+            sig_info->si_addr < watched_region->addr + watched_region->size)
+            break;
+    }
 
 
     if (watched_page) {
-        printf("%s: raised because of invalid r/w acces to address (was in watchlist) ...\n", __func__);
+        fprintf(stderr, "%s: raised because of invalid r/w acces to address (was in watchlist) ...\n", __func__);
         // printf("Fault instruction loc: 0x%016llx, len: %d\n", context->uc_mcontext.gregs[REG_RIP], len);
         // context->uc_mcontext.gregs[REG_RIP] += len;
 
+            
         mprotect (watched_page->addr, watched_page->size, PROT_READ | PROT_WRITE);
         void *payload_page = (void*)_alloc_payload(rip, len);
         context->uc_mcontext.gregs[REG_RIP] = (uintptr_t)payload_page;
         struct _seg_callback *cb = malloc(sizeof(struct _seg_callback));
         cb->page = payload_page;
         cb->next_inst = rip+len;
-        cb->watch = watched_page;
+        cb->watched_page = watched_page;
+        cb->watched_region = watched_region;
 
         LIST_ADD(_callback_list, cb);
+        
 
-        printf("---\n");
+        fprintf(stderr, "---\n");
     }
     
 
     if (!watched_page && !callback) {
-        printf("---\n");
+        fprintf(stderr, "---\n");
         exit(1);
     }
 

@@ -2,11 +2,13 @@ CC=gcc
 LDFLAGS=-pthread -lZydis -lZycore
 CFLAGS=-O2 -g -I/usr/include/x86_64-linux-gnu
 
-PROGS=napsy test_page_access
+PROGS=napsy
+TESTS=test_page_access test_small_region_access test_multipage_region_access\
+		test_multiregion_page_access
 
-all: $(PROGS)
+all: $(PROGS) $(TESTS)
 
-test_page_access: test_page_access.o memwatcher.o
+test_%: test_%.o memwatcher.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 %.o: %.c
@@ -14,6 +16,9 @@ test_page_access: test_page_access.o memwatcher.o
 
 test:
 	./test_page_access
+	./test_small_region_access
+	./test_multipage_region_access
+	./test_multiregion_page_access
 
 clean:
-	rm -f $(PROGS) *.o
+	rm -f $(PROGS) *.o $(TESTS)
