@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <fcntl.h> 
 #include <stdio.h> 
+#include <stdarg.h>
 #include <string.h> 
 #include <sys/stat.h> 
 #include <sys/types.h> 
@@ -20,6 +21,14 @@
 #define PAGE_SIZE 0x1000
 #define INLINE inline __attribute__((always_inline))
 #define MEMWATCHER_STR "MemWatcher"
+
+#define PRINTF(fmt, ...) do { fprintf(stderr, "%s: " fmt, MEMWATCHER_STR, ##__VA_ARGS__); } while(0)
+#define PERROR(fmt, ...) do { fprintf(stderr, "%s: Error " fmt "\n", MEMWATCHER_STR, ##__VA_ARGS__); exit(1); } while(0)
+#ifdef MEMWATCHER_DEBUG
+#define DPRINTF(fmt, ...) do { fprintf(stderr, "%s: " fmt, MEMWATCHER_STR, ##__VA_ARGS__); } while (0)
+#else
+#define DPRINTF(fmt, ...) do {} while(0)
+#endif
 
 /* 
  * mprotect() works with pages. 
@@ -87,15 +96,11 @@ uint32_t _get_trap_count() {
 
 static void __attribute__((constructor)) _init_memwatcher() {
     int ret;
-    ret = pthread_spin_init(&page_list_lock, PTHREAD_PROCESS_PRIVATE);
-    if (ret != 0) {
-        fprintf(stderr, "Failed to init spin lock\n");
-        exit(1);
+    if ((ret = pthread_spin_init(&page_list_lock, PTHREAD_PROCESS_PRIVATE)) != 0) {
+        PERROR("init spin lock");
     }
-    ret = pthread_spin_init(&cb_list_lock, PTHREAD_PROCESS_PRIVATE);
-    if (ret != 0) {
-        fprintf(stderr, "Failed to init spin lock\n");
-        exit(1);
+    if ((ret = pthread_spin_init(&cb_list_lock, PTHREAD_PROCESS_PRIVATE)) != 0) {
+        PERROR("init spin lock");
     }
 
     // Setup our signal handler 
@@ -106,34 +111,30 @@ static void __attribute__((constructor)) _init_memwatcher() {
 }
 
 INLINE void _pagelist_lock() {
-    int ret = pthread_spin_lock(&page_list_lock);
-    if (ret != 0) {
-        fprintf(stderr, "Failed to lock\n");
-        exit(1);
+    int ret;
+    if ((ret = pthread_spin_lock(&page_list_lock)) != 0) {
+        PERROR("lock");
     }
 }
 
 INLINE void _pagelist_unlock() {
-    int ret = pthread_spin_unlock(&page_list_lock);
-    if (ret != 0) {
-        fprintf(stderr, "Failed to unlock\n");
-        exit(1);
+    int ret;
+    if ((ret = pthread_spin_unlock(&page_list_lock)) != 0) {
+        PERROR("unlock");
     }
 }
 
 INLINE void _cblist_lock() {
-    int ret = pthread_spin_lock(&cb_list_lock);
-    if (ret != 0) {
-        fprintf(stderr, "Failed to lock\n");
-        exit(1);
+    int ret;
+    if ((ret = pthread_spin_lock(&cb_list_lock)) != 0) {
+        PERROR("lock");
     }
 }
 
 INLINE void _callbackinfo_unlock() {
-    int ret = pthread_spin_unlock(&cb_list_lock);
-    if (ret != 0) {
-        fprintf(stderr, "Failed to unlock\n");
-        exit(1);
+    int ret;
+    if ((ret = pthread_spin_unlock(&cb_list_lock)) != 0) {
+        PERROR("unlock");
     }
 }
 
@@ -142,13 +143,11 @@ void _watch_page(void *addr, int prot) {
     list_for_each(pagep, _page_watchlist) {
         if (pagep->addr == addr) {
             if (pagep->prot == prot) {
-                fprintf(stderr, "inc\n");
+                DPRINTF("inc\n");
                 pagep->region_cnt ++;
             }
             else {
-                fprintf(stderr, "%s: trying to set different protection on the same page\n", 
-                                        MEMWATCHER_STR);
-                exit(1);
+                PERROR("trying to set different protection on the same page");
             }
             return;
         }
@@ -177,8 +176,7 @@ void _watch_address(void *addr, size_t size, int prot) {
     list_for_each(regionp, _region_watchlist) {
         if ((watched_region->addr >= regionp->addr && watched_region->addr < regionp->addr + regionp->size) ||
              watched_region->addr+watched_region->size > regionp->addr && watched_region->addr+watched_region->size <= regionp->addr + regionp->size ) {
-            fprintf(stderr, "%s: Error in range\n", MEMWATCHER_STR);
-            exit(1);
+            PERROR("Request region in range\n");
         }
     }
 
@@ -199,7 +197,7 @@ void _unwatch_page(void*addr, int prot) {
         if (pagep->addr == addr) {
             if (pagep->region_cnt > 1) {
                 pagep->region_cnt--;
-                fprintf(stderr, "dec\n");
+                DPRINTF("dec\n");
             }
             else {
                 mprotect(pagep->addr, pagep->size, prot);
@@ -221,8 +219,7 @@ void _unwatch_address(void *addr, int prot) {
         }
     }
     if (!regionp) {
-        fprintf(stderr, "%s: error: unwatch address not exist\n", MEMWATCHER_STR);
-        exit(1);
+        PERROR("unwatch address does not exist");
     }
     for (uintptr_t page = (uintptr_t)regionp->addr & -PAGE_SIZE;
                     page < (uintptr_t)regionp->addr + regionp->size; 
@@ -254,7 +251,7 @@ static void* _alloc_payload(void* inst, uint8_t inst_len) {
     if (res == 0) {
         exit(2);
     }
-    printf("%s: Page allocated at %p\n", __func__, res);
+    DPRINTF("%s: Page allocated at %p\n", __func__, res);
     mprotect(res, PAGE_SIZE, PROT_WRITE);
     memcpy(res, inst, inst_len);
     // mov    QWORD PTR [rip+0x0],0x1
@@ -271,14 +268,14 @@ static void _sigsegv_protector(int s, siginfo_t *sig_info, void *vcontext)
     ucontext_t *context = (ucontext_t*)vcontext;
     unsigned char len = 0;
     void *rip;
-    fprintf(stderr, "---\n");
-    fprintf(stderr, "%s: Process received segmentation fault, examening ...\n", __func__);
-    fprintf(stderr, "%s: cause was address %p\n", __func__, sig_info->si_addr);
+    DPRINTF("---\n");
+    DPRINTF("%s: Process received segmentation fault, examening ...\n", __func__);
+    DPRINTF("%s: cause was address %p\n", __func__, sig_info->si_addr);
 
     rip = (void*)context->uc_mcontext.gregs[REG_RIP];
     len = _instr_len(rip);
-    fprintf(stderr, "%s: The next instruction loc: %p\n", __func__, rip);
-    fprintf(stderr, "%s:                      len: %d\n", __func__, len);
+    DPRINTF("%s: The next instruction loc: %p\n", __func__, rip);
+    DPRINTF("%s:                      len: %d\n", __func__, len);
     
 
     struct _seg_callback *callback;
@@ -294,7 +291,7 @@ static void _sigsegv_protector(int s, siginfo_t *sig_info, void *vcontext)
 
     if (callback) {
         /* change page permission back and set RIP back */
-        fprintf(stderr, "%s: raised because of trap from callback ...\n", __func__);
+        DPRINTF("%s: raised because of trap from callback ...\n", __func__);
         mprotect(callback->watched_page->addr, callback->watched_page->size, callback->watched_page->prot);
         context->uc_mcontext.gregs[REG_RIP] = (uintptr_t)callback->next_inst;
 
@@ -306,10 +303,11 @@ static void _sigsegv_protector(int s, siginfo_t *sig_info, void *vcontext)
         
         LIST_DEL(_callback_list, callback);
         if (callback->watched_region) {
-            fprintf(stderr, "%s: region watched\n", __func__);
+            DPRINTF("%s: region watched\n", __func__);
             count ++;
         }
         free(callback);
+        DPRINTF("---\n");
         goto release;
     } 
 
@@ -330,7 +328,7 @@ static void _sigsegv_protector(int s, siginfo_t *sig_info, void *vcontext)
 
 
     if (watched_page) {
-        fprintf(stderr, "%s: raised because of invalid r/w acces to address (was in watchlist) ...\n", __func__);
+        DPRINTF("%s: raised because of invalid r/w acces to address (was in watchlist) ...\n", __func__);
         // printf("Fault instruction loc: 0x%016llx, len: %d\n", context->uc_mcontext.gregs[REG_RIP], len);
         // context->uc_mcontext.gregs[REG_RIP] += len;
 
@@ -350,14 +348,18 @@ static void _sigsegv_protector(int s, siginfo_t *sig_info, void *vcontext)
         LIST_ADD(_callback_list, cb);
         
 
-        fprintf(stderr, "---\n");
+        DPRINTF("---\n");
+        goto release;
     }
     
 
-    if (!watched_page && !callback) {
-        fprintf(stderr, "---\n");
-        exit(1);
-    }
+    /* !watched_page && !callback */
+    
+    /* Real sigsegv */
+    DPRINTF("---\n");
+    exit(139);
+
+
 release:
     // ignore exit above
     _pagelist_unlock();

@@ -8,6 +8,9 @@ TESTS=test_page_access test_small_region_access test_multipage_region_access\
 
 all: $(PROGS) $(TESTS)
 
+debug: CFLAGS+=-DMEMWATCHER_DEBUG
+debug: all
+
 test_%: test_%.o memwatcher.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
