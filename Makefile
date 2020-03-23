@@ -3,8 +3,11 @@ LDFLAGS=-pthread -lZydis -lZycore
 CFLAGS=-O2 -g -I/usr/include/x86_64-linux-gnu
 
 PROGS=napsy
-TESTS=test_page_access test_small_region_access test_multipage_region_access\
-		test_multiregion_page_access
+TESTS = test_page_access \
+	    test_small_region_access \
+		test_multipage_region_access \
+		test_multiregion_page_access \
+		test_segfault
 
 all: $(PROGS) $(TESTS)
 
@@ -22,6 +25,7 @@ test:
 	./test_small_region_access
 	./test_multipage_region_access
 	./test_multiregion_page_access
+	./test_segfault || [ "$$?" = 139 ]
 
 clean:
 	rm -f $(PROGS) *.o $(TESTS)
