@@ -170,8 +170,17 @@ void _watch_address(void *addr, size_t size, int prot) {
     struct _watch_region *watched_region = malloc(sizeof(*watched_region));
     watched_region->addr = addr;
     watched_region->size = size;
+    watched_region->ref_cnt = 1;
     
     _pagelist_lock();
+    struct _watch_region *regionp;
+    list_for_each(regionp, _region_watchlist) {
+        if ((watched_region->addr >= regionp->addr && watched_region->addr < regionp->addr + regionp->size) ||
+             watched_region->addr+watched_region->size > regionp->addr && watched_region->addr+watched_region->size <= regionp->addr + regionp->size ) {
+            fprintf(stderr, "%s: Error in range\n", MEMWATCHER_STR);
+            exit(1);
+        }
+    }
 
     LIST_ADD(_region_watchlist, watched_region);
     for (uintptr_t page = (uintptr_t)addr & -PAGE_SIZE; 
@@ -220,7 +229,8 @@ void _unwatch_address(void *addr, int prot) {
                     page += PAGE_SIZE) {
                 _unwatch_page((void*)page, prot);
     }
-    LIST_DEL(_region_watchlist, regionp);
+    if (--regionp->ref_cnt == 0)
+        LIST_DEL(_region_watchlist, regionp);
     _pagelist_unlock();
 }
 
@@ -280,21 +290,29 @@ static void _sigsegv_protector(int s, siginfo_t *sig_info, void *vcontext)
     }
 
     _cblist_lock();
+    _pagelist_lock();
+
     if (callback) {
+        /* change page permission back and set RIP back */
         fprintf(stderr, "%s: raised because of trap from callback ...\n", __func__);
         mprotect(callback->watched_page->addr, callback->watched_page->size, callback->watched_page->prot);
         context->uc_mcontext.gregs[REG_RIP] = (uintptr_t)callback->next_inst;
 
+        /* dealloc callback */
         munmap(callback->page, PAGE_SIZE);
+        if (callback->watched_region && --callback->watched_region->ref_cnt == 0) {
+            LIST_DEL(_region_watchlist, callback->watched_region);
+        }
+        
         LIST_DEL(_callback_list, callback);
         if (callback->watched_region) {
             fprintf(stderr, "%s: region watched\n", __func__);
             count ++;
         }
         free(callback);
+        goto release;
     } 
 
-    _pagelist_lock();
     struct _watch_page *watched_page;
 
     list_for_each(watched_page, _page_watchlist) {
@@ -325,6 +343,9 @@ static void _sigsegv_protector(int s, siginfo_t *sig_info, void *vcontext)
         cb->next_inst = rip+len;
         cb->watched_page = watched_page;
         cb->watched_region = watched_region;
+        /* watched_region could be NULL */
+        if (watched_region)
+            watched_region->ref_cnt ++;
 
         LIST_ADD(_callback_list, cb);
         
@@ -337,7 +358,7 @@ static void _sigsegv_protector(int s, siginfo_t *sig_info, void *vcontext)
         fprintf(stderr, "---\n");
         exit(1);
     }
-
+release:
     // ignore exit above
     _pagelist_unlock();
     _callbackinfo_unlock();
